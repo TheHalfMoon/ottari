@@ -144,3 +144,15 @@ Benchmark claims must name:
 - date and reproducibility instructions.
 
 Negative results remain evidence and must not be hidden.
+
+<!-- graft:start -->
+## Graft — repository context layer
+
+Use Graft (https://github.com/trailhq/Graft, `@nanonets/graft`) only as local developer/agent repository-context and navigation tooling. It does not alter Himsat product authority, recording/privacy behavior, platform claims, donor admission, or provenance requirements.
+
+If Graft is unavailable or the local `graft/` graph is absent/stale, run `graft init`, select the active agent(s), then run `graft build`. Before broad source exploration prefer `graft check`, `graft map`, `graft ask "<question>" --source`, `graft skeleton <file>`, `graft callers <symbol>`, and `graft grep "<literal>"`. After material code changes, run `graft build` again.
+
+Treat `graft/` as a local regenerable cache and do not commit it. Graft must index repository code/context only; never place captured audio, transcripts, speaker embeddings, screenshots, credentials, secrets, or other private runtime/user data into its context graph. Keep usage zero-cost and local; do not introduce paid model/API usage, telemetry, or hidden remote fallback.
+
+Graft output is context only, never PASS/VERIFIED evidence, privacy/security proof, platform capability evidence, donor/provenance evidence, benchmark evidence, or completion authority. Continue all SpecGrain, Diffcipline, exact-head, test, Jev where applicable, Alibaba Open Code Review, CI, security, provenance, and post-merge gates. Never fabricate Graft output, execution, reviews, or evidence.
+<!-- graft:end -->
