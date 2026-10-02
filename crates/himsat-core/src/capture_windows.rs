@@ -94,6 +94,10 @@ pub enum WindowsMicError {
     NoInputDevices,
     /// A device exists but its stream failed at the given stage.
     StreamFault(StreamStage),
+    /// WASAPI reported a non-terminal buffer discontinuity (`Xrun`).
+    /// The stream keeps flowing; callers record it in loss accounting
+    /// rather than falsely treating it as a route failure.
+    DataDiscontinuity,
     /// The OS denied or revoked microphone access (Windows microphone
     /// privacy). Distinct from absence: the endpoint exists but policy
     /// forbids capture.
@@ -121,6 +125,7 @@ impl WindowsMicError {
             Self::NoInputDevices => "no-input-devices",
             Self::StreamFault(StreamStage::Build) => "stream-build-fault",
             Self::StreamFault(StreamStage::Play) => "stream-play-fault",
+            Self::DataDiscontinuity => "data-discontinuity",
             Self::PermissionDenied => "permission-denied",
             Self::ExclusiveModeConflict => "exclusive-mode-conflict",
             Self::EndpointUnavailable => "endpoint-unavailable",
@@ -229,7 +234,7 @@ pub const fn event_for_start_failure(error: &WindowsMicError) -> CaptureEvent {
 #[must_use]
 pub const fn event_for_runtime_fault(error: &WindowsMicError) -> Option<CaptureEvent> {
     match error {
-        WindowsMicError::RouteRerouted => None,
+        WindowsMicError::RouteRerouted | WindowsMicError::DataDiscontinuity => None,
         WindowsMicError::PermissionDenied => {
             Some(CaptureEvent::Interrupted(HealthReason::PermissionRevoked))
         }
@@ -243,7 +248,7 @@ pub const fn event_for_runtime_fault(error: &WindowsMicError) -> Option<CaptureE
 #[must_use]
 pub const fn health_reason_for(error: &WindowsMicError) -> Option<HealthReason> {
     match error {
-        WindowsMicError::RouteRerouted => None,
+        WindowsMicError::RouteRerouted | WindowsMicError::DataDiscontinuity => None,
         WindowsMicError::PermissionDenied => Some(HealthReason::PermissionRevoked),
         _ => Some(HealthReason::RouteChanged),
     }
@@ -376,8 +381,9 @@ pub fn classify_error(kind: cpal::ErrorKind, stage: StreamStage) -> WindowsMicEr
         cpal::ErrorKind::DeviceNotAvailable => WindowsMicError::EndpointUnavailable,
         cpal::ErrorKind::HostUnavailable => WindowsMicError::AudioServiceUnavailable,
         cpal::ErrorKind::DeviceChanged => WindowsMicError::RouteRerouted,
+        cpal::ErrorKind::Xrun => WindowsMicError::DataDiscontinuity,
         // Format negotiation, resource exhaustion, stream invalidation,
-        // xruns, and backend-specific failures stay stream faults at the
+        // and backend-specific failures stay stream faults at the
         // stage they occurred; the OS detail keeps the distinction.
         _ => WindowsMicError::StreamFault(stage),
     }
@@ -579,6 +585,7 @@ mod tests {
             WindowsMicError::NoInputDevices,
             WindowsMicError::StreamFault(StreamStage::Build),
             WindowsMicError::StreamFault(StreamStage::Play),
+            WindowsMicError::DataDiscontinuity,
             WindowsMicError::PermissionDenied,
             WindowsMicError::ExclusiveModeConflict,
             WindowsMicError::EndpointUnavailable,
@@ -751,7 +758,13 @@ mod tests {
                     "runtime mapping refused for {}",
                     fault.classifier()
                 ),
-                None => assert_eq!(fault, WindowsMicError::RouteRerouted),
+                None => assert!(
+                    matches!(
+                        fault,
+                        WindowsMicError::RouteRerouted | WindowsMicError::DataDiscontinuity
+                    ),
+                    "only flowing telemetry conditions may omit a machine event"
+                ),
             }
         }
     }
@@ -843,11 +856,12 @@ mod tests {
         assert_eq!(classifiers[0], "no-input-devices");
         assert_eq!(classifiers[1], "stream-build-fault");
         assert_eq!(classifiers[2], "stream-play-fault");
-        assert_eq!(classifiers[3], "permission-denied");
-        assert_eq!(classifiers[4], "exclusive-mode-conflict");
-        assert_eq!(classifiers[5], "endpoint-unavailable");
-        assert_eq!(classifiers[6], "audio-service-unavailable");
-        assert_eq!(classifiers[7], "route-rerouted");
+        assert_eq!(classifiers[3], "data-discontinuity");
+        assert_eq!(classifiers[4], "permission-denied");
+        assert_eq!(classifiers[5], "exclusive-mode-conflict");
+        assert_eq!(classifiers[6], "endpoint-unavailable");
+        assert_eq!(classifiers[7], "audio-service-unavailable");
+        assert_eq!(classifiers[8], "route-rerouted");
         let mut unique = classifiers.clone();
         unique.sort_unstable();
         unique.dedup();
@@ -863,7 +877,8 @@ mod tests {
 mod windows_tests {
     use super::{
         CpalMicrophoneBackend, MicrophoneBackend, SampleFormat, StreamStage, WindowsMicError,
-        classify_error, open_f32_input_stream, portable_sample_format, select_input,
+        classify_error, event_for_runtime_fault, health_reason_for, open_f32_input_stream,
+        portable_sample_format, select_input,
     };
     use crate::capture_checkpoint::ChunkCodec;
     use crate::capture_journal_commit::{ChunkJournal, SinkBinding};
@@ -909,10 +924,10 @@ mod windows_tests {
             classify_error(cpal::ErrorKind::UnsupportedConfig, StreamStage::Build),
             WindowsMicError::StreamFault(StreamStage::Build)
         );
-        assert_eq!(
-            classify_error(cpal::ErrorKind::Xrun, StreamStage::Play),
-            WindowsMicError::StreamFault(StreamStage::Play)
-        );
+        let xrun = classify_error(cpal::ErrorKind::Xrun, StreamStage::Play);
+        assert_eq!(xrun, WindowsMicError::DataDiscontinuity);
+        assert_eq!(event_for_runtime_fault(&xrun), None);
+        assert_eq!(health_reason_for(&xrun), None);
         assert_eq!(
             classify_error(cpal::ErrorKind::Other, StreamStage::Build),
             WindowsMicError::StreamFault(StreamStage::Build)

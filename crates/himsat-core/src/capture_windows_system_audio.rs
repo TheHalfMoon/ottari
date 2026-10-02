@@ -59,6 +59,9 @@ pub enum WindowsSystemAudioError {
     NoRenderEndpoints,
     /// An endpoint exists but its loopback stream failed at the stage.
     StreamFault(StreamStage),
+    /// WASAPI reported a non-terminal buffer discontinuity (`Xrun`).
+    /// The stream remains live; loss accounting owns this evidence.
+    DataDiscontinuity,
     /// The OS refused access to the endpoint or its policy surface.
     PermissionDenied,
     /// The endpoint is held by another client in a blocking mode.
@@ -83,6 +86,7 @@ impl WindowsSystemAudioError {
             Self::NoRenderEndpoints => "no-render-endpoints",
             Self::StreamFault(StreamStage::Build) => "stream-build-fault",
             Self::StreamFault(StreamStage::Play) => "stream-play-fault",
+            Self::DataDiscontinuity => "data-discontinuity",
             Self::PermissionDenied => "permission-denied",
             Self::ExclusiveModeConflict => "exclusive-mode-conflict",
             Self::EndpointUnavailable => "endpoint-unavailable",
@@ -189,7 +193,7 @@ pub const fn event_for_start_failure(error: &WindowsSystemAudioError) -> Capture
 #[must_use]
 pub const fn event_for_runtime_fault(error: &WindowsSystemAudioError) -> Option<CaptureEvent> {
     match error {
-        WindowsSystemAudioError::RouteRerouted => None,
+        WindowsSystemAudioError::RouteRerouted | WindowsSystemAudioError::DataDiscontinuity => None,
         WindowsSystemAudioError::PermissionDenied => {
             Some(CaptureEvent::Interrupted(HealthReason::PermissionRevoked))
         }
@@ -203,7 +207,7 @@ pub const fn event_for_runtime_fault(error: &WindowsSystemAudioError) -> Option<
 #[must_use]
 pub const fn health_reason_for(error: &WindowsSystemAudioError) -> Option<HealthReason> {
     match error {
-        WindowsSystemAudioError::RouteRerouted => None,
+        WindowsSystemAudioError::RouteRerouted | WindowsSystemAudioError::DataDiscontinuity => None,
         WindowsSystemAudioError::PermissionDenied => Some(HealthReason::PermissionRevoked),
         _ => Some(HealthReason::RouteChanged),
     }
@@ -334,6 +338,7 @@ pub fn classify_error(kind: cpal::ErrorKind, stage: StreamStage) -> WindowsSyste
         cpal::ErrorKind::DeviceNotAvailable => WindowsSystemAudioError::EndpointUnavailable,
         cpal::ErrorKind::HostUnavailable => WindowsSystemAudioError::AudioServiceUnavailable,
         cpal::ErrorKind::DeviceChanged => WindowsSystemAudioError::RouteRerouted,
+        cpal::ErrorKind::Xrun => WindowsSystemAudioError::DataDiscontinuity,
         _ => WindowsSystemAudioError::StreamFault(stage),
     }
 }
@@ -525,6 +530,7 @@ mod tests {
             WindowsSystemAudioError::NoRenderEndpoints,
             WindowsSystemAudioError::StreamFault(StreamStage::Build),
             WindowsSystemAudioError::StreamFault(StreamStage::Play),
+            WindowsSystemAudioError::DataDiscontinuity,
             WindowsSystemAudioError::PermissionDenied,
             WindowsSystemAudioError::ExclusiveModeConflict,
             WindowsSystemAudioError::EndpointUnavailable,
@@ -689,7 +695,14 @@ mod tests {
                     "runtime mapping refused for {}",
                     fault.classifier()
                 ),
-                None => assert_eq!(fault, WindowsSystemAudioError::RouteRerouted),
+                None => assert!(
+                    matches!(
+                        fault,
+                        WindowsSystemAudioError::RouteRerouted
+                            | WindowsSystemAudioError::DataDiscontinuity
+                    ),
+                    "only flowing telemetry conditions may omit a machine event"
+                ),
             }
         }
     }
@@ -781,8 +794,9 @@ mod tests {
         assert_eq!(classifiers[0], "no-render-endpoints");
         assert_eq!(classifiers[1], "stream-build-fault");
         assert_eq!(classifiers[2], "stream-play-fault");
-        assert_eq!(classifiers[5], "endpoint-unavailable");
-        assert_eq!(classifiers[7], "route-rerouted");
+        assert_eq!(classifiers[3], "data-discontinuity");
+        assert_eq!(classifiers[6], "endpoint-unavailable");
+        assert_eq!(classifiers[8], "route-rerouted");
         let mut unique = classifiers.clone();
         unique.sort_unstable();
         unique.dedup();
@@ -840,7 +854,7 @@ mod windows_tests {
         );
         assert_eq!(
             classify_error(cpal::ErrorKind::Xrun, StreamStage::Play),
-            WindowsSystemAudioError::StreamFault(StreamStage::Play)
+            WindowsSystemAudioError::DataDiscontinuity
         );
         assert_eq!(
             classify_error(cpal::ErrorKind::DeviceChanged, StreamStage::Play),
