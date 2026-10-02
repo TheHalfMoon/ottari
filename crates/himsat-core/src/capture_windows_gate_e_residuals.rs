@@ -105,7 +105,7 @@ fn live_multi_hour_capture_reports_continuity() {
     let frame_counter = Arc::clone(&frames);
     let signal_counter = Arc::clone(&signal_frames);
     let error_counter = Arc::clone(&errors);
-    let (error_tx, error_rx) = std::sync::mpsc::sync_channel::<(String, String)>(1);
+    let (error_tx, error_rx) = std::sync::mpsc::sync_channel::<(&'static str, String)>(1);
 
     let stream = open_f32_input_stream(
         &selected.info.device_id,
@@ -117,8 +117,8 @@ fn live_multi_hour_capture_reports_continuity() {
             }
         },
         move |error, detail| {
-            error_counter.fetch_add(1, Ordering::Relaxed);
-            let _ = error_tx.try_send((error.classifier().to_owned(), detail));
+            let _ = error_tx.try_send((error.classifier(), detail));
+            error_counter.fetch_add(1, Ordering::Release);
         },
     )
     .unwrap_or_else(|error| panic!("multi-hour stream open failed: {}", error.classifier()));
@@ -136,7 +136,7 @@ fn live_multi_hour_capture_reports_continuity() {
         } else if last_progress.elapsed() > Duration::from_secs(10) {
             panic!("multi-hour capture made no callback progress for more than 10 seconds");
         }
-        let error_count = errors.load(Ordering::Relaxed);
+        let error_count = errors.load(Ordering::Acquire);
         if error_count != 0 {
             let (classifier, detail) = error_rx.try_recv().unwrap_or_else(|_| {
                 (
