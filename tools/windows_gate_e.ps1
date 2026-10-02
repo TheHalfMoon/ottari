@@ -28,7 +28,14 @@ function Invoke-HimsatTest {
         [string]$LogName
     )
     $logPath = Join-Path $EvidenceDir $LogName
-    & $TestBinary $TestName --exact --nocapture *>&1 | Tee-Object -FilePath $logPath | Out-Host
+    # Windows PowerShell 5.1 turns native stderr records into synthetic
+    # NativeCommandError objects when they cross the PowerShell pipeline.
+    # Merge stderr into stdout inside cmd.exe instead, preserving live output
+    # (including HIMSAT_GATE_E_ARMED), the raw native text, and the real exit code.
+    $resolvedTestBinary = (Resolve-Path -LiteralPath $TestBinary).Path
+    $commandProcessor = (Get-Command cmd.exe -CommandType Application -ErrorAction Stop).Source
+    $nativeCommand = ('"{0}" "{1}" --exact --nocapture 2>&1' -f $resolvedTestBinary, $TestName)
+    & $commandProcessor /d /s /c $nativeCommand | Tee-Object -FilePath $logPath | Out-Host
     $exitCode = $LASTEXITCODE
     $logText = Get-Content -LiteralPath $logPath -Raw
     $gateResult = if ($logText -match 'HIMSAT_GATE_E_RESULT=(\{[^\r\n]+\})') {
@@ -44,7 +51,7 @@ function Invoke-HimsatTest {
     }
 }
 
-if ($env:OS -ne "Windows_NT") {
+if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
     throw "Gate E hardware bundle must run on Windows."
 }
 

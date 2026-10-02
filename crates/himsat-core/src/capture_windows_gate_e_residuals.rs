@@ -3,6 +3,7 @@
 use crate::capture_windows::{
     CpalMicrophoneBackend, WindowsMicError, open_f32_input_stream, select_input,
 };
+use crate::capture_windows_lifecycle::StreamLossAccount;
 use crate::capture_windows_pressure::{
     AdmissionDecision, RefusalReason, StorageBudgets, decide_admission,
 };
@@ -26,6 +27,7 @@ fn fault_code(error: &WindowsMicError) -> usize {
         WindowsMicError::AudioServiceUnavailable => 5,
         WindowsMicError::NoInputDevices => 6,
         WindowsMicError::StreamFault(_) => 7,
+        WindowsMicError::DataDiscontinuity => 8,
     }
 }
 
@@ -98,34 +100,85 @@ fn live_multi_hour_capture_reports_continuity() {
         .expect("multi-hour probe needs a selected endpoint");
 
     let callbacks = Arc::new(AtomicUsize::new(0));
-    let frames = Arc::new(AtomicUsize::new(0));
-    let signal_frames = Arc::new(AtomicUsize::new(0));
-    let errors = Arc::new(AtomicUsize::new(0));
+    let samples = Arc::new(AtomicUsize::new(0));
+    let signal_samples = Arc::new(AtomicUsize::new(0));
+    let discontinuities = Arc::new(AtomicUsize::new(0));
+    let reroutes = Arc::new(AtomicUsize::new(0));
+    let fatal_errors = Arc::new(AtomicUsize::new(0));
     let callback_counter = Arc::clone(&callbacks);
-    let frame_counter = Arc::clone(&frames);
-    let signal_counter = Arc::clone(&signal_frames);
-    let error_counter = Arc::clone(&errors);
+    let sample_counter = Arc::clone(&samples);
+    let signal_counter = Arc::clone(&signal_samples);
+    let discontinuity_counter = Arc::clone(&discontinuities);
+    let reroute_counter = Arc::clone(&reroutes);
+    let fatal_counter = Arc::clone(&fatal_errors);
 
     let stream = open_f32_input_stream(
         &selected.info.device_id,
         move |input: &[f32]| {
             callback_counter.fetch_add(1, Ordering::Relaxed);
-            frame_counter.fetch_add(input.len(), Ordering::Relaxed);
+            sample_counter.fetch_add(input.len(), Ordering::Relaxed);
             if input.iter().any(|sample| sample.abs() > 0.000_01) {
                 signal_counter.fetch_add(input.len(), Ordering::Relaxed);
             }
         },
-        move |_error, _detail| {
-            error_counter.fetch_add(1, Ordering::Relaxed);
+        move |error, _detail| match error {
+            WindowsMicError::DataDiscontinuity => {
+                discontinuity_counter.fetch_add(1, Ordering::Relaxed);
+            }
+            WindowsMicError::RouteRerouted => {
+                reroute_counter.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                fatal_counter.fetch_add(1, Ordering::Relaxed);
+            }
         },
     )
     .unwrap_or_else(|error| panic!("multi-hour stream open failed: {}", error.classifier()));
 
-    let start = Instant::now();
-    let hold = Duration::from_secs(seconds);
+    // WASAPI may report startup xruns while the shared engine settles. They are
+    // preserved as warm-up evidence, but the endurance window starts only after
+    // two seconds of proven flow. Any discontinuity inside the measured window
+    // still fails the zero-unexplained-loss claim.
+    let warmup = Duration::from_secs(2);
+    let warmup_start = Instant::now();
     let mut last_callbacks = 0_usize;
     let mut last_progress = Instant::now();
-    while start.elapsed() < hold {
+    while warmup_start.elapsed() < warmup {
+        std::thread::sleep(Duration::from_millis(50));
+        let current = callbacks.load(Ordering::Relaxed);
+        if current > last_callbacks {
+            last_callbacks = current;
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() > Duration::from_secs(1) {
+            panic!("multi-hour warm-up made no callback progress for more than one second");
+        }
+        assert_eq!(
+            fatal_errors.load(Ordering::Relaxed),
+            0,
+            "multi-hour warm-up reported a terminal runtime stream error"
+        );
+    }
+    assert!(
+        callbacks.load(Ordering::Relaxed) > 0,
+        "multi-hour warm-up delivered no callbacks"
+    );
+
+    let base_callbacks = callbacks.load(Ordering::Relaxed);
+    let base_samples = samples.load(Ordering::Relaxed);
+    let base_signal = signal_samples.load(Ordering::Relaxed);
+    let base_discontinuities = discontinuities.load(Ordering::Relaxed);
+    let base_reroutes = reroutes.load(Ordering::Relaxed);
+    let base_fatal = fatal_errors.load(Ordering::Relaxed);
+    let channels = usize::from(stream.config().channels);
+    assert!(channels > 0, "multi-hour stream reported zero channels");
+
+    let hold = Duration::from_secs(seconds);
+    let expected_frames = StreamLossAccount::expected_frames(stream.config().sample_rate_hz, hold);
+    let start = Instant::now();
+    let hard_deadline = hold + Duration::from_secs(10);
+    let mut last_callbacks = base_callbacks;
+    let mut last_progress = Instant::now();
+    loop {
         std::thread::sleep(Duration::from_millis(250));
         let current = callbacks.load(Ordering::Relaxed);
         if current > last_callbacks {
@@ -135,21 +188,52 @@ fn live_multi_hour_capture_reports_continuity() {
             panic!("multi-hour capture made no callback progress for more than 10 seconds");
         }
         assert_eq!(
-            errors.load(Ordering::Relaxed),
-            0,
-            "multi-hour capture reported a runtime stream error"
+            fatal_errors.load(Ordering::Relaxed),
+            base_fatal,
+            "multi-hour capture reported a terminal runtime stream error"
+        );
+        assert_eq!(
+            discontinuities.load(Ordering::Relaxed),
+            base_discontinuities,
+            "multi-hour capture reported a data discontinuity inside the measured window"
+        );
+
+        let delivered_samples = samples.load(Ordering::Relaxed).saturating_sub(base_samples);
+        let delivered_frames = delivered_samples / channels;
+        if start.elapsed() >= hold
+            && u64::try_from(delivered_frames).unwrap_or(u64::MAX) >= expected_frames
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < hard_deadline,
+            "multi-hour capture did not deliver the expected frame count within the settlement allowance"
         );
     }
     drop(stream);
 
-    let callback_count = callbacks.load(Ordering::Relaxed);
-    let frame_count = frames.load(Ordering::Relaxed);
-    let non_silent = signal_frames.load(Ordering::Relaxed);
+    let callback_count = callbacks
+        .load(Ordering::Relaxed)
+        .saturating_sub(base_callbacks);
+    let frame_count = samples.load(Ordering::Relaxed).saturating_sub(base_samples) / channels;
+    let non_silent = signal_samples
+        .load(Ordering::Relaxed)
+        .saturating_sub(base_signal)
+        / channels;
+    let warmup_discontinuities = base_discontinuities;
+    let route_reroutes = reroutes
+        .load(Ordering::Relaxed)
+        .saturating_sub(base_reroutes);
+    let frame_count_u64 = u64::try_from(frame_count).unwrap_or(u64::MAX);
+    let unexplained_shortfall = expected_frames.saturating_sub(frame_count_u64);
     assert!(
         callback_count > 0,
         "multi-hour capture delivered no callbacks"
     );
-    assert!(frame_count > 0, "multi-hour capture delivered no frames");
+    assert_eq!(
+        unexplained_shortfall, 0,
+        "multi-hour capture has unexplained frame loss"
+    );
     if strict_signal {
         assert!(
             non_silent > 0,
@@ -157,7 +241,7 @@ fn live_multi_hour_capture_reports_continuity() {
         );
     }
     println!(
-        "HIMSAT_GATE_E_RESULT={{\"path\":\"microphone-multi-hour\",\"outcome\":\"continuous\",\"seconds\":{seconds},\"callbacks\":{callback_count},\"frames\":{frame_count},\"non_silent_frames\":{non_silent},\"runtime_errors\":0}}"
+        "HIMSAT_GATE_E_RESULT={{\"path\":\"microphone-multi-hour\",\"outcome\":\"continuous\",\"seconds\":{seconds},\"callbacks\":{callback_count},\"frames\":{frame_count},\"expected_frames\":{expected_frames},\"unexplained_shortfall\":{unexplained_shortfall},\"non_silent_frames\":{non_silent},\"warmup_discontinuities\":{warmup_discontinuities},\"runtime_discontinuities\":0,\"route_reroutes\":{route_reroutes},\"terminal_runtime_errors\":0}}"
     );
 }
 
@@ -180,16 +264,28 @@ fn live_physical_removal_reports_endpoint_unavailable() {
 
     let callbacks = Arc::new(AtomicUsize::new(0));
     let observed_fault = Arc::new(AtomicUsize::new(0));
+    let discontinuities = Arc::new(AtomicUsize::new(0));
+    let reroutes = Arc::new(AtomicUsize::new(0));
     let callback_counter = Arc::clone(&callbacks);
     let fault_slot = Arc::clone(&observed_fault);
+    let discontinuity_counter = Arc::clone(&discontinuities);
+    let reroute_counter = Arc::clone(&reroutes);
     let stream = open_f32_input_stream(
         &selected.info.device_id,
         move |_frames| {
             callback_counter.fetch_add(1, Ordering::Relaxed);
         },
-        move |error, _detail| {
-            let code = fault_code(&error);
-            let _ = fault_slot.compare_exchange(0, code, Ordering::Relaxed, Ordering::Relaxed);
+        move |error, _detail| match error {
+            WindowsMicError::DataDiscontinuity => {
+                discontinuity_counter.fetch_add(1, Ordering::Relaxed);
+            }
+            WindowsMicError::RouteRerouted => {
+                reroute_counter.fetch_add(1, Ordering::Relaxed);
+            }
+            other => {
+                let code = fault_code(&other);
+                let _ = fault_slot.compare_exchange(0, code, Ordering::Relaxed, Ordering::Relaxed);
+            }
         },
     )
     .unwrap_or_else(|error| {
@@ -199,8 +295,27 @@ fn live_physical_removal_reports_endpoint_unavailable() {
         )
     });
 
+    // Do not arm on stream-open alone. Prove live callback flow first so a
+    // startup xrun cannot be mistaken for the detach result.
+    let warmup_deadline = Instant::now() + Duration::from_secs(2);
+    while callbacks.load(Ordering::Relaxed) < 10 && Instant::now() < warmup_deadline {
+        assert_eq!(
+            observed_fault.load(Ordering::Relaxed),
+            0,
+            "physical-removal probe saw a terminal fault before arming"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let callbacks_before_arm = callbacks.load(Ordering::Relaxed);
+    assert!(
+        callbacks_before_arm >= 10,
+        "physical-removal probe did not prove stable pre-removal live flow"
+    );
+    let discontinuities_before_arm = discontinuities.load(Ordering::Relaxed);
+    let reroutes_before_arm = reroutes.load(Ordering::Relaxed);
+
     println!(
-        "HIMSAT_GATE_E_ARMED={{\"path\":\"physical-removal\",\"device_selector\":\"configured\",\"wait_seconds\":{wait_seconds}}}"
+        "HIMSAT_GATE_E_ARMED={{\"path\":\"physical-removal\",\"device_selector\":\"configured\",\"wait_seconds\":{wait_seconds},\"callbacks_before_arm\":{callbacks_before_arm},\"warmup_discontinuities\":{discontinuities_before_arm}}}"
     );
     let deadline = Instant::now() + Duration::from_secs(wait_seconds);
     while observed_fault.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
@@ -210,15 +325,17 @@ fn live_physical_removal_reports_endpoint_unavailable() {
 
     let callback_count = callbacks.load(Ordering::Relaxed);
     let code = observed_fault.load(Ordering::Relaxed);
-    assert!(
-        callback_count > 0,
-        "physical-removal probe did not prove pre-removal live flow"
-    );
+    let runtime_discontinuities = discontinuities
+        .load(Ordering::Relaxed)
+        .saturating_sub(discontinuities_before_arm);
+    let route_reroutes = reroutes
+        .load(Ordering::Relaxed)
+        .saturating_sub(reroutes_before_arm);
     assert_eq!(
         code, 1,
         "physical removal must surface endpoint-unavailable; observed fault code {code}"
     );
     println!(
-        "HIMSAT_GATE_E_RESULT={{\"path\":\"physical-removal\",\"outcome\":\"classified_fault\",\"classifier\":\"endpoint-unavailable\",\"callbacks_before_fault\":{callback_count}}}"
+        "HIMSAT_GATE_E_RESULT={{\"path\":\"physical-removal\",\"outcome\":\"classified_fault\",\"classifier\":\"endpoint-unavailable\",\"callbacks_before_arm\":{callbacks_before_arm},\"callbacks_total\":{callback_count},\"warmup_discontinuities\":{discontinuities_before_arm},\"runtime_discontinuities\":{runtime_discontinuities},\"route_reroutes\":{route_reroutes}}}"
     );
 }
