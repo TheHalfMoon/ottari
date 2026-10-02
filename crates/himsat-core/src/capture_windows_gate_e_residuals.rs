@@ -138,12 +138,9 @@ fn live_multi_hour_capture_reports_continuity() {
         }
         let error_count = errors.load(Ordering::Acquire);
         if error_count != 0 {
-            let (classifier, detail) = error_rx.try_recv().unwrap_or_else(|_| {
-                (
-                    "unavailable".to_owned(),
-                    "no first-error detail captured".to_owned(),
-                )
-            });
+            let (classifier, detail) = error_rx
+                .try_recv()
+                .unwrap_or_else(|_| ("unavailable", "no first-error detail captured".to_owned()));
             panic!(
                 "multi-hour capture reported {error_count} runtime stream errors; first_classifier={classifier}; first_detail={detail}"
             );
