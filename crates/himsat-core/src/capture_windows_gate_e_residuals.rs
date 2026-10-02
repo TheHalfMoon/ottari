@@ -105,6 +105,7 @@ fn live_multi_hour_capture_reports_continuity() {
     let frame_counter = Arc::clone(&frames);
     let signal_counter = Arc::clone(&signal_frames);
     let error_counter = Arc::clone(&errors);
+    let (error_tx, error_rx) = std::sync::mpsc::sync_channel::<(String, String)>(1);
 
     let stream = open_f32_input_stream(
         &selected.info.device_id,
@@ -115,8 +116,9 @@ fn live_multi_hour_capture_reports_continuity() {
                 signal_counter.fetch_add(input.len(), Ordering::Relaxed);
             }
         },
-        move |_error, _detail| {
+        move |error, detail| {
             error_counter.fetch_add(1, Ordering::Relaxed);
+            let _ = error_tx.try_send((error.classifier().to_owned(), detail));
         },
     )
     .unwrap_or_else(|error| panic!("multi-hour stream open failed: {}", error.classifier()));
@@ -134,11 +136,18 @@ fn live_multi_hour_capture_reports_continuity() {
         } else if last_progress.elapsed() > Duration::from_secs(10) {
             panic!("multi-hour capture made no callback progress for more than 10 seconds");
         }
-        assert_eq!(
-            errors.load(Ordering::Relaxed),
-            0,
-            "multi-hour capture reported a runtime stream error"
-        );
+        let error_count = errors.load(Ordering::Relaxed);
+        if error_count != 0 {
+            let (classifier, detail) = error_rx.try_recv().unwrap_or_else(|_| {
+                (
+                    "unavailable".to_owned(),
+                    "no first-error detail captured".to_owned(),
+                )
+            });
+            panic!(
+                "multi-hour capture reported {error_count} runtime stream errors; first_classifier={classifier}; first_detail={detail}"
+            );
+        }
     }
     drop(stream);
 
